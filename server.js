@@ -18,9 +18,10 @@ app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 40 }));
 
 const userSchema = new mongoose.Schema({ name: { type: String, required: true, trim: true }, email: { type: String, required: true, unique: true, lowercase: true, trim: true }, password: { type: String, required: true }, role: { type: String, enum: ['user', 'admin'], default: 'user' } }, { timestamps: true });
 const eventSchema = new mongoose.Schema({ title: { type: String, required: true, trim: true }, slug: { type: String, required: true, unique: true, lowercase: true }, category: { type: String, default: 'Community' }, date: { type: Date, required: true }, endDate: Date, location: { type: String, required: true }, description: { type: String, default: '' }, image: { type: String, default: '' }, destinationUrl: { type: String, required: true }, capacity: { type: Number, default: 100 }, featured: { type: Boolean, default: false }, active: { type: Boolean, default: true } }, { timestamps: true });
+const settingSchema = new mongoose.Schema({ key: { type: String, unique: true, required: true }, event: { type: mongoose.Schema.Types.ObjectId, ref: 'Event', default: null } }, { timestamps: true });
 const registrationSchema = new mongoose.Schema({ user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, event: { type: mongoose.Schema.Types.ObjectId, ref: 'Event', required: true }, registeredAt: { type: Date, default: Date.now } });
 registrationSchema.index({ user: 1, event: 1 }, { unique: true });
-const User = mongoose.model('User', userSchema), Event = mongoose.model('Event', eventSchema), Registration = mongoose.model('Registration', registrationSchema);
+const User = mongoose.model('User', userSchema), Event = mongoose.model('Event', eventSchema), SiteSetting = mongoose.model('SiteSetting', settingSchema), Registration = mongoose.model('Registration', registrationSchema);
 
 function tokenFor(user) { return jwt.sign({ id: user._id, role: user.role, name: user.name, email: user.email }, JWT_SECRET, { expiresIn: '7d' }); }
 function auth(req, res, next) { const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, ''); try { req.user = jwt.verify(token, JWT_SECRET); next(); } catch { return res.status(401).json({ message: 'Please sign in to continue.' }); } }
@@ -54,10 +55,35 @@ app.get('/api/events', asyncRoute(async (req, res) => {
   if (req.headers.authorization) { try { const u = jwt.verify(req.headers.authorization.replace(/^Bearer\s+/i, ''), JWT_SECRET); const rows = await Registration.find({ user: u.id, event: { $in: ids } }).select('event'); registered = new Set(rows.map(r => String(r.event))); } catch {} }
   res.json(events.map(e => safeEvent({ ...e, registrationCount: countMap[String(e._id)] || 0, registered: registered.has(String(e._id)) })));
 }));
+function sharedQrUrl(req) { return `${(process.env.BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '')}/go/current`; }
+async function selectedQrEvent() {
+  const setting = await SiteSetting.findOne({ key: 'shared-qr-event' }).populate('event');
+  if (setting?.event?.active) return setting.event;
+  const fallback = await Event.findOne({ active: true, date: { $gte: new Date() } }).sort({ date: 1 });
+  if (fallback) await SiteSetting.findOneAndUpdate({ key: 'shared-qr-event' }, { event: fallback._id }, { upsert: true, new: true });
+  return fallback;
+}
+app.get('/api/admin/qr-target', auth, admin, asyncRoute(async (req, res) => {
+  const event = await selectedQrEvent();
+  res.json({ eventId: event?._id || null, title: event?.title || null, url: sharedQrUrl(req) });
+}));
+app.put('/api/admin/qr-target', auth, admin, asyncRoute(async (req, res) => {
+  const event = await Event.findOne({ _id: req.body.eventId, active: true });
+  if (!event) return res.status(400).json({ message: 'Choose an active event for the shared QR code.' });
+  await SiteSetting.findOneAndUpdate({ key: 'shared-qr-event' }, { event: event._id }, { upsert: true, new: true });
+  res.json({ eventId: event._id, title: event.title, url: sharedQrUrl(req) });
+}));
+app.get('/api/admin/shared-qr', auth, admin, asyncRoute(async (req, res) => {
+  const event = await selectedQrEvent();
+  if (!event) return res.status(404).json({ message: 'Add an active event before downloading the shared QR code.' });
+  const url = sharedQrUrl(req);
+  res.json({ url, title: event.title, dataUrl: await QRCode.toDataURL(url, { width: 480, margin: 2, color: { dark: '#183b35', light: '#ffffff' }, errorCorrectionLevel: 'H' }) });
+}));
+// Keep old admin QR links compatible: every event now returns the same shared QR image.
 app.get('/api/events/:id/qr', auth, admin, asyncRoute(async (req, res) => {
-  const event = await Event.findById(req.params.id); if (!event) return res.status(404).json({ message: 'Event not found.' });
-  const url = `${(process.env.BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '')}/go/${event.slug}`;
-  res.json({ url, dataUrl: await QRCode.toDataURL(url, { width: 480, margin: 2, color: { dark: '#183b35', light: '#ffffff' }, errorCorrectionLevel: 'H' }) });
+  const event = await selectedQrEvent(); if (!event) return res.status(404).json({ message: 'Add an active event before downloading the shared QR code.' });
+  const url = sharedQrUrl(req);
+  res.json({ url, title: event.title, dataUrl: await QRCode.toDataURL(url, { width: 480, margin: 2, color: { dark: '#183b35', light: '#ffffff' }, errorCorrectionLevel: 'H' }) });
 }));
 app.post('/api/events/:id/register', auth, asyncRoute(async (req, res) => {
   const event = await Event.findById(req.params.id); if (!event || !event.active) return res.status(404).json({ message: 'This event is no longer available.' });
@@ -85,6 +111,7 @@ function validateEvent(body) {
   const slug = (body.slug || title).toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   return { title, slug, location, date, category: (body.category || 'Community').trim(), description: (body.description || '').trim(), destinationUrl, image: (body.image || '').trim(), capacity: Math.max(1, Number(body.capacity) || 100), featured: Boolean(body.featured), active: body.active !== false };
 }
+app.get('/go/current', asyncRoute(async (req, res) => { const event = await selectedQrEvent(); if (!event?.active) return res.status(404).sendFile(path.join(__dirname, 'public', 'unavailable.html')); res.redirect(302, event.destinationUrl); }));
 app.get('/go/:slug', asyncRoute(async (req, res) => { const e = await Event.findOne({ slug: req.params.slug }); if (!e) return res.status(404).sendFile(path.join(__dirname, 'public', 'unavailable.html')); if (!e.active) return res.status(410).sendFile(path.join(__dirname, 'public', 'unavailable.html')); res.redirect(302, e.destinationUrl); }));
 app.use('/api', (err, req, res, next) => { console.error(err); res.status(err.status || (err.code === 11000 ? 409 : 500)).json({ message: err.status ? err.message : err.code === 11000 ? 'That event slug is already in use.' : 'Something went wrong. Please try again.' }); });
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));

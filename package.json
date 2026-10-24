@@ -4,7 +4,7 @@
   "private": true,
   "description": "A calm event discovery and stable QR redirect platform",
   "main": "server.js",
-  "scripts": { "start": "node server.js", "dev": "node --watch server.js" },
+  "scripts": { "start": "node server.js", "dev": "node --watch server.js", "seed:test-users": "node scripts/seed-test-users.js" },
   "dependencies": {
     "bcryptjs": "^2.4.3", "dotenv": "^16.4.7", "express": "^4.21.2",
     "express-rate-limit": "^7.5.0", "helmet": "^8.0.0", "jsonwebtoken": "^9.0.2",
